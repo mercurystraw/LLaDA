@@ -2,8 +2,10 @@
 This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
 import accelerate
+import json
 import torch
 import re
+import time
 from pathlib import Path
 import random
 from contextlib import nullcontext
@@ -54,6 +56,7 @@ class ILLaDAEvalHarness(LM):
         end_think_text='</think>',
         end_think_logit_boost=0.,
         end_think_boost_power=2.,
+        throughput_output=None,
         device="cuda",
         **kwargs,
     ):
@@ -142,6 +145,7 @@ class ILLaDAEvalHarness(LM):
         )
         self.end_think_logit_boost = end_think_logit_boost
         self.end_think_boost_power = end_think_boost_power
+        self.throughput_output = throughput_output
 
     @property
     def rank(self):
@@ -386,7 +390,23 @@ class ILLaDAEvalHarness(LM):
         ds = ds.with_format("torch")
 
         out = []
-        for elem in tqdm(ds, desc="Generating..."):
+        output_tokens = 0
+        generated_compute_tokens = 0
+        generation_seconds = 0.
+        throughput_output_path = None
+        stream_file = None
+        partial_throughput_path = None
+        if self.throughput_output:
+            throughput_output_path = Path(self.throughput_output)
+            throughput_output_path.parent.mkdir(parents=True, exist_ok=True)
+            stream_path = throughput_output_path.parent / f'generations.rank{self.rank}.jsonl'
+            partial_throughput_path = (
+                throughput_output_path.parent
+                / f'throughput.rank{self.rank}.partial.json'
+            )
+            stream_file = stream_path.open('w', encoding='utf-8', buffering=1)
+
+        for sample_index, elem in enumerate(tqdm(ds, desc="Generating...")):
             # iLLaDA currently evaluates one unpadded prompt at a time.
             prompt = elem["question"].unsqueeze(0)
             if self.add_bos_token:
@@ -416,6 +436,9 @@ class ILLaDAEvalHarness(LM):
                 end_think_logit_boost=self.end_think_logit_boost,
                 end_think_boost_power=self.end_think_boost_power,
             )
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize(self.device)
+            generation_start = time.perf_counter()
             if self.var:
                 generated_answer = var_generate(
                     self.model, self.tokenizer, prompt,
@@ -425,13 +448,96 @@ class ILLaDAEvalHarness(LM):
                 generated_answer = generate(
                     self.model, prompt, **generation_kwargs
                 )
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize(self.device)
+            sample_generation_seconds = time.perf_counter() - generation_start
+            sample_compute_tokens = generated_answer.shape[1] - prompt.shape[1]
+            generation_seconds += sample_generation_seconds
+            generated_compute_tokens += sample_compute_tokens
             
             generated_answer = self.tokenizer.decode(generated_answer[0][prompt.shape[1]:], skip_special_tokens=False)
             for stop_seq in stop_tokens:
                     if stop_seq in generated_answer:
                         generated_answer = generated_answer.split(stop_seq)[0]
+            sample_output_tokens = len(self.tokenizer.encode(
+                generated_answer, add_special_tokens=False
+            ))
+            output_tokens += sample_output_tokens
 
             out.append(generated_answer)
+
+            if stream_file is not None and partial_throughput_path is not None:
+                request = requests[sample_index]
+                stream_file.write(json.dumps({
+                    'rank': self.rank,
+                    'sample_index': sample_index,
+                    'task_name': request.task_name,
+                    'doc_id': request.doc_id,
+                    'prompt': request.args[0],
+                    'response': generated_answer,
+                    'output_tokens': sample_output_tokens,
+                    'generated_compute_tokens': sample_compute_tokens,
+                    'generation_seconds': sample_generation_seconds,
+                }, ensure_ascii=False) + '\n')
+                stream_file.flush()
+
+                partial_stats = {
+                    'rank': self.rank,
+                    'completed_samples': sample_index + 1,
+                    'output_tokens': output_tokens,
+                    'generated_compute_tokens': generated_compute_tokens,
+                    'generation_seconds': generation_seconds,
+                    'tokens_per_second': output_tokens / generation_seconds,
+                    'compute_tokens_per_second': (
+                        generated_compute_tokens / generation_seconds
+                    ),
+                }
+                partial_tmp_path = partial_throughput_path.with_suffix('.json.tmp')
+                partial_tmp_path.write_text(
+                    json.dumps(partial_stats, indent=2) + '\n', encoding='utf-8'
+                )
+                partial_tmp_path.replace(partial_throughput_path)
+
+        if stream_file is not None:
+            stream_file.close()
+
+        local_stats = torch.tensor(
+            [len(out), output_tokens, generated_compute_tokens, generation_seconds],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if self.accelerator is not None:
+            all_stats = self.accelerator.gather(local_stats).reshape(-1, 4)
+        else:
+            all_stats = local_stats.unsqueeze(0)
+
+        if self.rank == 0:
+            total_samples = int(all_stats[:, 0].sum().item())
+            total_output_tokens = int(all_stats[:, 1].sum().item())
+            total_compute_tokens = int(all_stats[:, 2].sum().item())
+            summed_gpu_seconds = float(all_stats[:, 3].sum().item())
+            wall_seconds = float(all_stats[:, 3].max().item())
+            stats = {
+                'num_processes': self.world_size,
+                'num_samples': total_samples,
+                'output_tokens': total_output_tokens,
+                'generated_compute_tokens': total_compute_tokens,
+                'generation_seconds': wall_seconds,
+                'tokens_per_second': total_output_tokens / wall_seconds,
+                'tokens_per_second_per_gpu': total_output_tokens / summed_gpu_seconds,
+                'compute_tokens_per_second': total_compute_tokens / wall_seconds,
+                'mean_output_tokens_per_sample': total_output_tokens / total_samples,
+            }
+            print(
+                f"Generation throughput: {stats['tokens_per_second']:.3f} tokens/s "
+                f"({total_output_tokens} output tokens, {total_compute_tokens} computed "
+                f"tokens in {wall_seconds:.3f}s, "
+                f"{self.world_size} process(es))"
+            )
+            if throughput_output_path is not None:
+                throughput_output_path.write_text(
+                    json.dumps(stats, indent=2) + '\n', encoding='utf-8'
+                )
 
         return out
 

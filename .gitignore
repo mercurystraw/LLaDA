@@ -1,0 +1,3 @@
+/outputs*
+*_pycache__/
+/model_weights*
